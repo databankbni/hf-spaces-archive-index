@@ -1,0 +1,38 @@
+name: cron-probe-public
+
+# Dulu probe sekali-pakai, sekarang KANARI PERMANEN keandalan cron GitHub.
+#
+# Pertanyaan awalnya sudah terjawab: pada 2026-08-05T05:22:24Z workflow ini
+# akhirnya jalan lewat event `schedule` -- event `schedule` PERTAMA dalam
+# sejarah akun ini, setelah sensus sebelumnya menghasilkan nol dari 37 run.
+# Tapi jawabannya bukan "cron sudah beres": dengan cron '*/5' ia hanya menyala
+# 1 kali dari ~24 slot yang seharusnya. Jadi cron GitHub di akun ini nyata,
+# tetapi sporadis, dan tidak bisa dijadikan jadwal utama.
+#
+# Karena itu ia dipertahankan sebagai kanari, bukan dihapus: rasio
+# (jumlah run schedule) / (jumlah slot yang lewat) adalah satu-satunya ukuran
+# yang memberi tahu kapan rantai hop di runner publik boleh dipensiunkan dan
+# penjadwalan boleh dikembalikan ke cron biasa.
+#
+# Cadence diturunkan dari '*/5' (288 run/hari) menjadi sekali sejam. Menit repo
+# publik memang gratis, tetapi 288 run/hari untuk sekadar mencatat satu baris
+# waktu adalah pemborosan runner bersama tanpa tambahan informasi -- 24 sampel
+# sehari sudah cukup untuk mengukur keandalan jadwal yang cadence terpadatnya
+# 4 kali sehari. Menit 17 dipilih supaya jauh dari puncak antrean di awal jam.
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Catat bahwa penjadwal benar-benar menembak
+        run: |
+          echo "event=${{ github.event_name }}"
+          echo "utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
