@@ -1,0 +1,118 @@
+# Menerbitkan katalog lewat GitHub Actions, bukan pembangun Pages "legacy".
+#
+# Kenapa: pembangun legacy menjalankan Jekyll atas index.html berukuran 5+ MB
+# di repo yang riwayatnya sudah 87 MB, dan sejak 2026-08-06T12:28Z ia gagal
+# berulang ("Page build failed.") setelah menggantung ~10 menit -- termasuk
+# setelah .nojekyll ditambahkan. Akibatnya situs menyajikan halaman tujuh jam
+# lebih tua sementara commit-nya sudah mendarat, jadi katalog masih menaut ke
+# snapshot zip lama. Jalur Actions melewati Jekyll sepenuhnya dan meninggalkan
+# log yang bisa dibaca kalau gagal.
+name: pages
+
+# TANPA filter `paths`. publish-index memaksa-dorong SATU commit yatim tiap
+# terbit (supaya riwayat 5,7 MB/terbit tidak menumpuk), dan pada force-push
+# dengan riwayat tak berkaitan GitHub tidak menghasilkan daftar berkas berubah
+# yang bisa dicocokkan -- commit 0c180ecbbc mendarat tanpa memicu deploy sama
+# sekali. Repo ini hanya pernah menerima kiriman katalog, jadi memicu pada
+# setiap push ke main justru yang benar.
+on:
+  push:
+    branches: [main]
+  # Jaring pengaman. Run 31117823160 gagal di "Set up job" dengan
+  # "Failed to resolve action download info. Error: Service Unavailable" --
+  # gangguan infrastruktur GitHub, bukan kesalahan konfigurasi. Tanpa jadwal
+  # ulang, satu gangguan sesaat membekukan situs sampai terbit berikutnya.
+  # Langkah `Skip when the site already matches` membuat cron ini nyaris
+  # gratis kalau situs sudah benar.
+  schedule:
+    - cron: '37 */3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Satu penerbitan pada satu waktu. `cancel-in-progress: false` supaya kiriman
+# yang sedang jalan tidak dibatalkan oleh kiriman berikutnya -- yang terakhir
+# tetap menang, tetapi tidak ada yang setengah jadi.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.dep.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Skip when the site already matches
+        id: cek
+        run: |
+          code=$(curl -s -o /tmp/live.html -w '%{http_code}' -L \
+            -H 'Cache-Control: no-cache' \
+            "https://databankbni.github.io/hf-spaces-archive-index/?cb=$RANDOM")
+          if [ "$code" = "200" ] && cmp -s /tmp/live.html index.html; then
+            echo "situs sudah menyajikan isi repo ini; tidak perlu deploy"
+            echo "perlu=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "situs belum sepadan (HTTP $code); deploy"
+            echo "perlu=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sanity-check the payload
+        if: steps.cek.outputs.perlu == '1'
+        run: |
+          test -s index.html || { echo "::error::index.html hilang/kosong"; exit 1; }
+          b=$(stat -c%s index.html)
+          echo "index.html $b B"
+          # Katalog terenkripsi tidak boleh membocorkan id Space apa pun.
+          if grep -qE '"id":"[A-Za-z0-9._-]+/' index.html; then
+            echo "::error::index.html memuat id Space polos -- build publik salah"
+            exit 1
+          fi
+          # 25 MB: batas artefak Pages jauh di atas ini, tapi lonjakan mendadak
+          # berarti build privat yang bocor, bukan katalog publik.
+          [ "$b" -lt 26214400 ] || { echo "::error::index.html tak wajar besar"; exit 1; }
+          : > .nojekyll
+
+      - uses: actions/configure-pages@v5
+        if: steps.cek.outputs.perlu == '1'
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.cek.outputs.perlu == '1'
+        with:
+          path: .
+      - id: dep
+        if: steps.cek.outputs.perlu == '1'
+        uses: actions/deploy-pages@v4
+        with:
+          # Bawaan 10 menit. Situs ini berkali-kali tertahan di
+          # `deployment_in_progress` lewat 10 menit (run 31110425527), lalu
+          # aksinya sendiri yang membatalkan -- bukan backend yang menolak.
+          # Beri 30 menit sebelum menyerah.
+          timeout: 1800000
+          error_count: 20
+          reporting_interval: 10000
+
+      - name: Confirm the site serves this build
+        if: steps.cek.outputs.perlu == '1'
+        run: |
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /tmp/live.html -w '%{http_code}' -L \
+              -H 'Cache-Control: no-cache' \
+              "https://databankbni.github.io/hf-spaces-archive-index/?cb=$i$RANDOM")
+            [ "$code" = "200" ] && cmp -s /tmp/live.html index.html && break
+            sleep 10
+          done
+          if cmp -s /tmp/live.html index.html; then
+            echo "situs menyajikan build ini (byte identik)"
+          else
+            echo "::error::situs masih menyajikan build lama setelah 5 menit"
+            ls -l /tmp/live.html index.html
+            exit 1
+          fi

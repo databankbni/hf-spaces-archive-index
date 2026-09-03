@@ -1,0 +1,141 @@
+name: engine
+
+# Mesin arsip mandiri di LUAR Hugging Face.
+#
+# Kenapa di repo PUBLIK: repo privat hanya dapat 2.000 menit Actions gratis per
+# bulan dan sekarang sudah terpakai ~1.400 untuk backup + katalog. Repo publik
+# mendapat menit runner gratis TANPA BATAS, jadi pemindai 24/7 hanya mungkin di
+# sini. Repo privat tetap jadi tempat penyimpanan (state + hasil), diakses lewat
+# REST API, sehingga isi arsip tidak pernah menjadi publik.
+#
+# Kenapa rantai hop, bukan `schedule:`: satu job GitHub dibatasi 6 jam, dan
+# `schedule:` TIDAK PERNAH menyala di akun ini (0 event schedule sepanjang
+# riwayat akun — sudah dibuktikan dengan dua probe kembar). Jadi setiap hop
+# memicu penerusnya sendiri di langkah `if: always()`. Rantai inilah jam
+# eksternalnya, sekaligus yang menembak workflow privat yang jatuh tempo.
+#
+# Sakelar mati: buat berkas `engine.stop` di akar repo ini. Hop yang sedang
+# jalan akan berhenti pada pemeriksaan berikutnya dan TIDAK memicu penerus.
+
+on:
+  workflow_dispatch:
+    inputs:
+      hops:
+        description: nomor hop (naik otomatis di rantai)
+        default: '0'
+      hop_min:
+        description: menit kerja per hop (job dibatasi 6 jam)
+        default: '320'
+      workers:
+        description: jumlah thread penguji
+        default: '3'
+      scan:
+        description: pindai Space baru ('true'/'false')
+        default: 'true'
+      clock:
+        description: tembak workflow privat yang jatuh tempo ('true'/'false')
+        default: 'true'
+      chain:
+        description: picu hop penerus setelah selesai ('true'/'false')
+        default: 'true'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engine-chain
+  cancel-in-progress: false
+
+jobs:
+  hop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      GH_DISPATCH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}
+      GH_DISPATCH_REPO: ${{ vars.GH_DISPATCH_REPO }}
+      MONITOR_SPACE: ${{ vars.MONITOR_SPACE }}
+      CEREBRAS_KEYS: ${{ secrets.CEREBRAS_KEYS }}
+      HOP_MIN: ${{ inputs.hop_min }}
+      ENGINE_WORKERS: ${{ inputs.workers }}
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Info hop
+        run: |
+          echo "hop=${{ inputs.hops }} hop_min=${{ inputs.hop_min }} workers=${{ inputs.workers }}"
+          echo "scan=${{ inputs.scan }} clock=${{ inputs.clock }} chain=${{ inputs.chain }}"
+          echo "start=$(date -u +%FT%TZ)"
+          echo "HOP_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Dependensi
+        run: |
+          python -m pip install --quiet --disable-pip-version-check \
+            'requests==2.32.3' 'gradio_client==1.5.4' 'huggingface_hub==0.34.4'
+          python -c "import requests, gradio_client; print('deps ok', requests.__version__)"
+
+      - name: Ambil kode mesin dari repo privat
+        id: fetch
+        run: |
+          set -e
+          mkdir -p engine
+          for f in engine.py estore.py; do
+            code=$(curl -sS -o "engine/$f" -w '%{http_code}' \
+              -H "Authorization: Bearer $GH_DISPATCH_TOKEN" \
+              -H "Accept: application/vnd.github.raw" \
+              "https://api.github.com/repos/$GH_DISPATCH_REPO/contents/tools/$f")
+            echo "$f -> HTTP $code $(wc -c < engine/$f) B"
+            [ "$code" = "200" ] || exit 1
+          done
+          python -m py_compile engine/engine.py engine/estore.py
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: Jalankan hop
+        id: hop
+        continue-on-error: true
+        working-directory: engine
+        run: |
+          ARGS="hop --minutes ${{ inputs.hop_min }} --workers ${{ inputs.workers }}"
+          [ "${{ inputs.scan }}" = "true" ]  || ARGS="$ARGS --no-scan"
+          [ "${{ inputs.clock }}" = "true" ] || ARGS="$ARGS --no-clock"
+          python engine.py $ARGS 2>&1 | tail -c 900000
+          if [ -f engine_work/stopped ]; then
+            echo "stopped=$(cat engine_work/stopped)" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Jam eksternal minimum. Kalau langkah di atas gagal karena alasan apa
+      # pun, jadwal workflow privat TETAP harus ditembak — arsip lebih penting
+      # daripada pemindaian. Langkah ini hanya jam, tanpa pemindaian.
+      - name: Jam cadangan bila hop gagal
+        if: steps.hop.outcome == 'failure' && inputs.clock == 'true'
+        continue-on-error: true
+        working-directory: engine
+        run: python engine.py hop --minutes 5 --workers 0 --no-scan
+
+      - name: Picu hop penerus
+        if: always() && inputs.chain == 'true' && steps.hop.outputs.stopped != '1'
+        run: |
+          # Dua lokasi diterima: akar repo (paling gampang dibuat lewat UI)
+          # dan .github/engine.stop (tidak ikut terbit ke GitHub Pages).
+          for P in engine.stop .github/engine.stop; do
+            if curl -sf -o /dev/null \
+                -H "Authorization: Bearer $GH_DISPATCH_TOKEN" \
+                "https://api.github.com/repos/${{ github.repository }}/contents/$P"; then
+              echo "$P ada — rantai dihentikan."
+              exit 0
+            fi
+          done
+          # Anti-loop: kalau hop ini mati sangat cepat, jangan langsung
+          # menembak penerus, supaya kegagalan berulang tidak jadi loop panas.
+          ELAPSED=$(( $(date +%s) - HOP_START ))
+          echo "hop berjalan ${ELAPSED}s"
+          if [ "$ELAPSED" -lt 600 ]; then
+            echo "terlalu cepat, tunggu 300s dulu"
+            sleep 300
+          fi
+          NEXT=$(( ${{ inputs.hops }} + 1 ))
+          code=$(curl -sS -o /tmp/d.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $GH_DISPATCH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/engine.yml/dispatches" \
+            -d "{\"ref\":\"main\",\"inputs\":{\"hops\":\"$NEXT\",\"hop_min\":\"${{ inputs.hop_min }}\",\"workers\":\"${{ inputs.workers }}\",\"scan\":\"${{ inputs.scan }}\",\"clock\":\"${{ inputs.clock }}\",\"chain\":\"true\"}}")
+          echo "dispatch hop $NEXT -> HTTP $code $(cat /tmp/d.json)"
+          [ "$code" = "204" ] || exit 1
